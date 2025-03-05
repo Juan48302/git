@@ -180,13 +180,17 @@ int reftable_writer_new(struct reftable_writer **out,
 }
 
 int reftable_writer_set_limits(struct reftable_writer *w, uint64_t min,
-			       uint64_t max)
+				uint64_t max)
 {
 	/*
-	 * The limits should be set before any records are added to the writer.
-	 * Check if any records were added by checking if `last_key` was set.
+	  * Set the min/max update index limits for the reftable writer.
+	  * This must be called before adding any records, since:
+	  * - The 'next' field gets set after writing the first block.
+	  * - The 'last_key' field updates with each new record (but resets
+	  *   after sections).
+	  * Returns REFTABLE_API_ERROR if called after writing has begun.
 	 */
-	if (w->last_key.len)
+	if (w->next || w->last_key.len)
 		return REFTABLE_API_ERROR;
 
 	w->min_update_index = min;
@@ -586,7 +590,7 @@ static int writer_finish_section(struct reftable_writer *w)
 
 struct common_prefix_arg {
 	struct reftable_buf *last;
-	int max;
+	size_t max;
 };
 
 static void update_common(void *void_arg, void *key)
@@ -594,10 +598,9 @@ static void update_common(void *void_arg, void *key)
 	struct common_prefix_arg *arg = void_arg;
 	struct obj_index_tree_node *entry = key;
 	if (arg->last) {
-		int n = common_prefix_size(&entry->hash, arg->last);
-		if (n > arg->max) {
+		size_t n = common_prefix_size(&entry->hash, arg->last);
+		if (n > arg->max)
 			arg->max = n;
-		}
 	}
 	arg->last = &entry->hash;
 }

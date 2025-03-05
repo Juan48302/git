@@ -273,13 +273,42 @@ struct configured_exclusion {
 static struct oidmap configured_exclusions;
 
 static struct oidset excluded_by_config;
-static int use_full_name_hash = -1;
+static int name_hash_version = -1;
+
+/**
+ * Check whether the name_hash_version chosen by user input is appropriate,
+ * and also validate whether it is compatible with other features.
+ */
+static void validate_name_hash_version(void)
+{
+	if (name_hash_version < 1 || name_hash_version > 2)
+		die(_("invalid --name-hash-version option: %d"), name_hash_version);
+	if (write_bitmap_index && name_hash_version != 1) {
+		warning(_("currently, --write-bitmap-index requires --name-hash-version=1"));
+		name_hash_version = 1;
+	}
+}
 
 static inline uint32_t pack_name_hash_fn(const char *name)
 {
-	if (use_full_name_hash)
-		return pack_full_name_hash(name);
-	return pack_name_hash(name);
+	static int seen_version = -1;
+
+	if (seen_version < 0)
+		seen_version = name_hash_version;
+	else if (seen_version != name_hash_version)
+		BUG("name hash version changed from %d to %d mid-process",
+		    seen_version, name_hash_version);
+
+	switch (name_hash_version) {
+	case 1:
+		return pack_name_hash(name);
+
+	case 2:
+		return pack_name_hash_v2((const unsigned char *)name);
+
+	default:
+		BUG("invalid name-hash version: %d", name_hash_version);
+	}
 }
 
 /*
@@ -1276,7 +1305,8 @@ static void write_pack_file(void)
 	struct object_entry **write_order;
 
 	if (progress > pack_to_stdout)
-		progress_state = start_progress(_("Writing objects"), nr_result);
+		progress_state = start_progress(the_repository,
+						_("Writing objects"), nr_result);
 	ALLOC_ARRAY(written_list, to_pack.nr_objects);
 	write_order = compute_write_order();
 
@@ -1330,8 +1360,9 @@ static void write_pack_file(void)
 			 */
 
 			int fd = finalize_hashfile(f, hash, FSYNC_COMPONENT_PACK, 0);
-			fixup_pack_header_footer(fd, hash, pack_tmp_name,
-						 nr_written, hash, offset);
+			fixup_pack_header_footer(the_hash_algo, fd, hash,
+						 pack_tmp_name, nr_written,
+						 hash, offset);
 			close(fd);
 			if (write_bitmap_index) {
 				if (write_bitmap_index != WRITE_BITMAP_QUIET)
@@ -1379,9 +1410,10 @@ static void write_pack_file(void)
 			if (cruft)
 				pack_idx_opts.flags |= WRITE_MTIMES;
 
-			stage_tmp_packfiles(&tmpname, pack_tmp_name,
-					    written_list, nr_written,
-					    &to_pack, &pack_idx_opts, hash,
+			stage_tmp_packfiles(the_hash_algo, &tmpname,
+					    pack_tmp_name, written_list,
+					    nr_written, &to_pack,
+					    &pack_idx_opts, hash,
 					    &idx_tmp_name);
 
 			if (write_bitmap_index) {
@@ -2412,7 +2444,8 @@ static void get_object_details(void)
 	struct object_entry **sorted_by_offset;
 
 	if (progress)
-		progress_state = start_progress(_("Counting objects"),
+		progress_state = start_progress(the_repository,
+						_("Counting objects"),
 						to_pack.nr_objects);
 
 	CALLOC_ARRAY(sorted_by_offset, to_pack.nr_objects);
@@ -3227,7 +3260,8 @@ static void find_deltas_by_region(struct object_entry *list,
 	progress_nr = regions[nr - 1].start + regions[nr - 1].nr;
 
 	if (progress)
-		progress_state = start_progress(_("Compressing objects by path"),
+		progress_state = start_progress(the_repository,
+						_("Compressing objects by path"),
 						progress_nr);
 
 	while (nr--)
@@ -3306,7 +3340,8 @@ static void ll_find_deltas_by_region(struct object_entry *list,
 	CALLOC_ARRAY(p, delta_search_threads);
 
 	if (progress)
-		progress_state = start_progress(_("Compressing objects by path"),
+		progress_state = start_progress(the_repository,
+						_("Compressing objects by path"),
 						progress_nr);
 	/* Partition the work amongst work threads. */
 	for (i = 0; i < delta_search_threads; i++) {
@@ -3443,7 +3478,8 @@ static void prepare_pack(int window, int depth)
 		unsigned nr_done = 0;
 
 		if (progress)
-			progress_state = start_progress(_("Compressing objects"),
+			progress_state = start_progress(the_repository,
+							_("Compressing objects"),
 							nr_deltas);
 		QSORT(delta_list, n, type_size_sort);
 		ll_find_deltas(delta_list, n, window+1, depth, &nr_done);
@@ -3871,7 +3907,8 @@ static void add_objects_in_unpacked_packs(void);
 static void enumerate_cruft_objects(void)
 {
 	if (progress)
-		progress_state = start_progress(_("Enumerating cruft objects"), 0);
+		progress_state = start_progress(the_repository,
+						_("Enumerating cruft objects"), 0);
 
 	add_objects_in_unpacked_packs();
 	add_unreachable_loose_objects();
@@ -3897,7 +3934,8 @@ static void enumerate_and_traverse_cruft_objects(struct string_list *fresh_packs
 	revs.ignore_missing_links = 1;
 
 	if (progress)
-		progress_state = start_progress(_("Enumerating cruft objects"), 0);
+		progress_state = start_progress(the_repository,
+						_("Enumerating cruft objects"), 0);
 	ret = add_unseen_recent_objects_to_traversal(&revs, cruft_expiration,
 						     set_cruft_mtime, 1);
 	stop_progress(&progress_state);
@@ -3916,7 +3954,8 @@ static void enumerate_and_traverse_cruft_objects(struct string_list *fresh_packs
 	if (prepare_revision_walk(&revs))
 		die(_("revision walk setup failed"));
 	if (progress)
-		progress_state = start_progress(_("Traversing cruft objects"), 0);
+		progress_state = start_progress(the_repository,
+						_("Traversing cruft objects"), 0);
 	nr_seen = 0;
 	traverse_commit_list(&revs, show_cruft_commit, show_cruft_object, NULL);
 
@@ -4282,6 +4321,15 @@ static int get_object_list_from_bitmap(struct rev_info *revs)
 {
 	if (!(bitmap_git = prepare_bitmap_walk(revs, 0)))
 		return -1;
+
+	/*
+	 * For now, force the name-hash version to be 1 since that
+	 * is the version implied by the bitmap format. Later, the
+	 * format can include this version explicitly in its format,
+	 * allowing readers to know the version that was used during
+	 * the bitmap write.
+	 */
+	name_hash_version = 1;
 
 	if (pack_options_allow_reuse())
 		reuse_partial_packfile_from_bitmap(bitmap_git,
@@ -4746,8 +4794,8 @@ int cmd_pack_objects(int argc,
 		OPT_STRING_LIST(0, "uri-protocol", &uri_protocols,
 				N_("protocol"),
 				N_("exclude any configured uploadpack.blobpackfileuri with this protocol")),
-		OPT_BOOL(0, "full-name-hash", &use_full_name_hash,
-			 N_("(EXPERIMENTAL!) optimize delta compression across identical path names over time")),
+		OPT_INTEGER(0, "name-hash-version", &name_hash_version,
+			 N_("use the specified name-hash function to group similar objects")),
 		OPT_END(),
 	};
 
@@ -4934,10 +4982,10 @@ int cmd_pack_objects(int argc,
 	if (pack_to_stdout || !rev_list_all)
 		write_bitmap_index = 0;
 
-	if (write_bitmap_index && use_full_name_hash > 0)
-		die(_("currently, the --full-name-hash option is incompatible with --write-bitmap-index"));
-	if (use_full_name_hash < 0)
-		use_full_name_hash = git_env_bool("GIT_TEST_FULL_NAME_HASH", 0);
+	if (name_hash_version < 0)
+		name_hash_version = (int)git_env_ulong("GIT_TEST_NAME_HASH_VERSION", 1);
+
+	validate_name_hash_version();
 
 	if (use_delta_islands)
 		strvec_push(&rp, "--topo-order");
@@ -4974,7 +5022,8 @@ int cmd_pack_objects(int argc,
 	prepare_packing_data(the_repository, &to_pack);
 
 	if (progress && !cruft)
-		progress_state = start_progress(_("Enumerating objects"), 0);
+		progress_state = start_progress(the_repository,
+						_("Enumerating objects"), 0);
 	if (stdin_packs) {
 		/* avoids adding objects in excluded packs */
 		ignore_packed_keep_in_core = 1;

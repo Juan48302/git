@@ -253,3 +253,5 @@ Release/
 *.dSYM
 /contrib/buildsystems/out
 CMakeSettings.json
+/contrib/libgit-rs/target
+/contrib/libgit-sys/target

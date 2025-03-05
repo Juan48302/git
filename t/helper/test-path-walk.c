@@ -20,6 +20,8 @@ static const char * const path_walk_usage[] = {
 };
 
 struct path_walk_test_data {
+	uintmax_t batch_nr;
+
 	uintmax_t commit_nr;
 	uintmax_t tree_nr;
 	uintmax_t blob_nr;
@@ -32,38 +34,34 @@ static int emit_block(const char *path, struct oid_array *oids,
 	struct path_walk_test_data *tdata = data;
 	const char *typestr;
 
-	switch (type) {
-	case OBJ_COMMIT:
-		typestr = "COMMIT";
-		tdata->commit_nr += oids->nr;
-		break;
-
-	case OBJ_TREE:
-		typestr = "TREE";
+	if (type == OBJ_TREE)
 		tdata->tree_nr += oids->nr;
-		break;
-
-	case OBJ_BLOB:
-		typestr = "BLOB";
+	else if (type == OBJ_BLOB)
 		tdata->blob_nr += oids->nr;
-		break;
-
-	case OBJ_TAG:
-		typestr = "TAG";
+	else if (type == OBJ_COMMIT)
+		tdata->commit_nr += oids->nr;
+	else if (type == OBJ_TAG)
 		tdata->tag_nr += oids->nr;
-		break;
-
-	default:
+	else
 		BUG("we do not understand this type");
-	}
+
+	typestr = type_name(type);
+
+	/* This should never be output during tests. */
+	if (!oids->nr)
+		printf("%"PRIuMAX":%s:%s:EMPTY\n",
+		       tdata->batch_nr, typestr, path);
 
 	for (size_t i = 0; i < oids->nr; i++) {
 		struct object *o = lookup_unknown_object(the_repository,
 							 &oids->oid[i]);
-		printf("%s:%s:%s%s\n", typestr, path, oid_to_hex(&oids->oid[i]),
+		printf("%"PRIuMAX":%s:%s:%s%s\n",
+		       tdata->batch_nr, typestr, path,
+		       oid_to_hex(&oids->oid[i]),
 		       o->flags & UNINTERESTING ? ":UNINTERESTING" : "");
 	}
 
+	tdata->batch_nr++;
 	return 0;
 }
 
@@ -128,6 +126,7 @@ int cmd__path_walk(int argc, const char **argv)
 		clear_pattern_list(info.pl);
 		free(info.pl);
 	}
+
 	release_revisions(&revs);
 	return res;
 }

@@ -23,6 +23,8 @@ typedef struct DIR {
 /* default dirent implementation */
 extern DIR *dirent_opendir(const char *dirname);
 
+#define opendir git_opendir
+
 /* current dirent implementation */
 extern DIR *(*opendir)(const char *dirname);
 

@@ -20,7 +20,8 @@ typedef int (*path_fn)(const char *path,
 struct path_walk_info {
 	/**
 	 * revs provides the definitions for the commit walk, including
-	 * which commits are UNINTERESTING or not.
+	 * which commits are UNINTERESTING or not. This structure is
+	 * expected to be owned by the caller.
 	 */
 	struct rev_info *revs;
 
@@ -31,6 +32,7 @@ struct path_walk_info {
 	 */
 	path_fn path_fn;
 	void *path_fn_data;
+
 	/**
 	 * Initialize which object types the path_fn should be called on. This
 	 * could also limit the walk to skip blobs if not set.
@@ -65,6 +67,9 @@ struct path_walk_info {
 	.commits = 1,		\
 	.tags = 1,		\
 }
+
+void path_walk_info_init(struct path_walk_info *info);
+void path_walk_info_clear(struct path_walk_info *info);
 
 /**
  * Given the configuration of 'info', walk the commits based on 'info->revs' and
