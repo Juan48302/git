@@ -597,7 +597,8 @@ static void do_load_refs(struct survey_context *ctx,
 
 	if (ctx->opts.show_progress) {
 		ctx->progress_total = 0;
-		ctx->progress = start_progress(_("Scanning refs..."), 0);
+		ctx->progress = start_progress(ctx->repo,
+					       _("Scanning refs..."), 0);
 	}
 
 	filter_refs(ref_array, &filter, FILTER_REFS_KIND_MASK);
@@ -843,7 +844,8 @@ static void survey_phase_objects(struct survey_context *ctx)
 	ctx->progress_nr = 0;
 	ctx->progress_total = ctx->ref_array.nr;
 	if (ctx->opts.show_progress)
-		ctx->progress = start_progress(_("Preparing object walk"),
+		ctx->progress = start_progress(ctx->repo,
+					       _("Preparing object walk"),
 					       ctx->progress_total);
 	for (int i = 0; i < ctx->ref_array.nr; i++) {
 		struct ref_array_item *item = ctx->ref_array.items[i];
@@ -855,7 +857,8 @@ static void survey_phase_objects(struct survey_context *ctx)
 	ctx->progress_nr = 0;
 	ctx->progress_total = 0;
 	if (ctx->opts.show_progress)
-		ctx->progress = start_progress(_("Walking objects"), 0);
+		ctx->progress = start_progress(ctx->repo,
+					       _("Walking objects"), 0);
 	walk_objects_by_path(&info);
 	stop_progress(&ctx->progress);
 
@@ -899,8 +902,8 @@ int cmd_survey(int argc, const char **argv, const char *prefix, struct repositor
 		OPT_END(),
 	};
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(survey_usage, survey_options);
+	show_usage_with_options_if_asked(argc, argv,
+					 survey_usage, survey_options);
 
 	if (isatty(2))
 		color_fprintf_ln(stderr,

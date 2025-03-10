@@ -13,10 +13,9 @@ int cmd__name_hash(int argc UNUSED, const char **argv UNUSED)
 	struct strbuf line = STRBUF_INIT;
 
 	while (!strbuf_getline(&line, stdin)) {
-		uint32_t name_hash = pack_name_hash(line.buf);
-		uint32_t full_hash = pack_full_name_hash(line.buf);
-
-		printf("%10"PRIu32"\t%10"PRIu32"\t%s\n", name_hash, full_hash, line.buf);
+		printf("%10u ", pack_name_hash(line.buf));
+		printf("%10u ", pack_name_hash_v2((unsigned const char *)line.buf));
+		printf("%s\n", line.buf);
 	}
 
 	strbuf_release(&line);

@@ -243,11 +243,12 @@ test_expect_success 'bug messages followed by BUG() are written to trace2' '
 	test_cmp expect actual
 '
 
-test_expect_success 'empty configuration values are handled' '
-  test_when_finished "rm trace2.normal actual expect" &&
-  echo >expect &&
-  GIT_TRACE2="$(pwd)/trace2.normal"  GIT_TRACE2_CONFIG_PARAMS=foo.empty \
-	  git -c foo.empty config foo.empty >actual &&
+test_expect_success 'a valueless true configuration variable is handled' '
+	test_when_finished "rm -f trace2.normal actual expect" &&
+	echo >expect &&
+	GIT_TRACE2="$(pwd)/trace2.normal" \
+	GIT_TRACE2_CONFIG_PARAMS=foo.true \
+	git -c foo.true config foo.true >actual &&
 	test_cmp expect actual
 '
 

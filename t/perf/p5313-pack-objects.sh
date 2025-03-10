@@ -14,27 +14,58 @@ test_expect_success 'create rev input' '
 	^$(git rev-parse HEAD~1)
 	EOF
 
-	cat >in-big <<-EOF
+	cat >in-big <<-EOF &&
 	$(git rev-parse HEAD)
 	^$(git rev-parse HEAD~1000)
 	EOF
+
+	cat >in-shallow <<-EOF
+	$(git rev-parse HEAD)
+	--shallow $(git rev-parse HEAD)
+	EOF
 '
 
-test_perf 'thin pack' '
-	git pack-objects --thin --stdout --revs --sparse  <in-thin >out
-'
+for version in 1 2
+do
+	export version
 
-test_size 'thin pack size' '
-	test_file_size out
-'
+	test_perf "thin pack with version $version" '
+		git pack-objects --thin --stdout --revs --sparse \
+			--name-hash-version=$version <in-thin >out
+	'
 
-test_perf 'thin pack with --full-name-hash' '
-	git pack-objects --thin --stdout --revs --sparse --full-name-hash <in-thin >out
-'
+	test_size "thin pack size with version $version" '
+		test_file_size out
+	'
 
-test_size 'thin pack size with --full-name-hash' '
-	test_file_size out
-'
+	test_perf "big pack with version $version" '
+		git pack-objects --stdout --revs --sparse \
+			--name-hash-version=$version <in-big >out
+	'
+
+	test_size "big pack size with version $version" '
+		test_file_size out
+	'
+
+	test_perf "shallow fetch pack with version $version" '
+		git pack-objects --stdout --revs --sparse --shallow \
+			--name-hash-version=$version <in-shallow >out
+	'
+
+	test_size "shallow pack size with version $version" '
+		test_file_size out
+	'
+
+	test_perf "repack with version $version" '
+		git repack -adf --name-hash-version=$version
+	'
+
+	test_size "repack size with version $version" '
+		gitdir=$(git rev-parse --git-dir) &&
+		pack=$(ls $gitdir/objects/pack/pack-*.pack) &&
+		test_file_size "$pack"
+	'
+done
 
 test_perf 'thin pack with --path-walk' '
 	git pack-objects --thin --stdout --revs --sparse --path-walk <in-thin >out
@@ -44,46 +75,12 @@ test_size 'thin pack size with --path-walk' '
 	test_file_size out
 '
 
-test_perf 'big pack' '
-	git pack-objects --stdout --revs --sparse  <in-big >out
-'
-
-test_size 'big pack size' '
-	test_file_size out
-'
-
-test_perf 'big pack with --full-name-hash' '
-	git pack-objects --stdout --revs --sparse --full-name-hash <in-big >out
-'
-
-test_size 'big pack size with --full-name-hash' '
-	test_file_size out
-'
-
 test_perf 'big pack with --path-walk' '
 	git pack-objects --stdout --revs --sparse --path-walk <in-big >out
 '
 
 test_size 'big pack size with --path-walk' '
 	test_file_size out
-'
-
-test_perf 'repack' '
-	git repack -adf
-'
-
-test_size 'repack size' '
-	pack=$(ls .git/objects/pack/pack-*.pack) &&
-	test_file_size "$pack"
-'
-
-test_perf 'repack with --full-name-hash' '
-	git repack -adf --full-name-hash
-'
-
-test_size 'repack size with --full-name-hash' '
-	pack=$(ls .git/objects/pack/pack-*.pack) &&
-	test_file_size "$pack"
 '
 
 test_perf 'repack with --path-walk' '

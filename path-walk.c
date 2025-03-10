@@ -8,8 +8,10 @@
 #include "dir.h"
 #include "hashmap.h"
 #include "hex.h"
+#include "list-objects.h"
 #include "object.h"
 #include "oid-array.h"
+#include "prio-queue.h"
 #include "repository.h"
 #include "revision.h"
 #include "string-list.h"
@@ -19,8 +21,9 @@
 #include "tree.h"
 #include "tree-walk.h"
 
-struct type_and_oid_list
-{
+static const char *root_path = "";
+
+struct type_and_oid_list {
 	enum object_type type;
 	struct oid_array oids;
 	int maybe_interesting;
@@ -48,15 +51,63 @@ struct path_walk_context {
 	struct strmap paths_to_lists;
 
 	/**
-	 * Store the current list of paths in a stack, to
-	 * facilitate depth-first-search without recursion.
+	 * Store the current list of paths in a priority queue,
+	 * using object type as a sorting mechanism, mostly to
+	 * make sure blobs are popped off the stack first. No
+	 * other sort is made, so within each object type it acts
+	 * like a stack and performs a DFS within the trees.
+	 *
+	 * Use path_stack_pushed to indicate whether a path
+	 * was previously added to path_stack.
 	 */
-	struct string_list path_stack;
+	struct prio_queue path_stack;
+	struct strset path_stack_pushed;
 };
 
-static int add_children(struct path_walk_context *ctx,
-			const char *base_path,
-			struct object_id *oid)
+static int compare_by_type(const void *one, const void *two, void *cb_data)
+{
+	struct type_and_oid_list *list1, *list2;
+	const char *str1 = one;
+	const char *str2 = two;
+	struct path_walk_context *ctx = cb_data;
+
+	list1 = strmap_get(&ctx->paths_to_lists, str1);
+	list2 = strmap_get(&ctx->paths_to_lists, str2);
+
+	/*
+	 * If object types are equal, then use path comparison.
+	 */
+	if (!list1 || !list2 || list1->type == list2->type)
+		return strcmp(str1, str2);
+
+	/* Prefer tags to be popped off first. */
+	if (list1->type == OBJ_TAG)
+		return -1;
+	if (list2->type == OBJ_TAG)
+		return 1;
+
+	/* Prefer blobs to be popped off second. */
+	if (list1->type == OBJ_BLOB)
+		return -1;
+	if (list2->type == OBJ_BLOB)
+		return 1;
+
+	return 0;
+}
+
+static void push_to_stack(struct path_walk_context *ctx,
+			  const char *path)
+{
+	if (strset_contains(&ctx->path_stack_pushed, path))
+		return;
+
+	strset_add(&ctx->path_stack_pushed, path);
+	prio_queue_put(&ctx->path_stack, xstrdup(path));
+}
+
+static int add_tree_entries(struct path_walk_context *ctx,
+			    const char *base_path,
+			    struct object_id *oid)
 {
 	struct tree_desc desc;
 	struct name_entry entry;
@@ -69,13 +120,13 @@ static int add_children(struct path_walk_context *ctx,
 		      oid_to_hex(oid));
 		return -1;
 	} else if (parse_tree_gently(tree, 1)) {
-		die("bad tree object %s", oid_to_hex(oid));
+		error("bad tree object %s", oid_to_hex(oid));
+		return -1;
 	}
 
 	strbuf_addstr(&path, base_path);
 	base_len = path.len;
 
-	parse_tree(tree);
 	init_tree_desc(&desc, &tree->object.oid, tree->buffer, tree->size);
 	while (tree_entry(&desc, &entry)) {
 		struct type_and_oid_list *list;
@@ -98,12 +149,14 @@ static int add_children(struct path_walk_context *ctx,
 			struct blob *child = lookup_blob(ctx->repo, &entry.oid);
 			o = child ? &child->object : NULL;
 		} else {
-			/* Wrong type? */
-			continue;
+			BUG("invalid type for tree entry: %d", type);
 		}
 
-		if (!o) /* report error?*/
-			continue;
+		if (!o) {
+			error(_("failed to find object %s"),
+			      oid_to_hex(&o->oid));
+			return -1;
+		}
 
 		/* Skip this object if already seen. */
 		if (o->flags & SEEN)
@@ -141,10 +194,12 @@ static int add_children(struct path_walk_context *ctx,
 			CALLOC_ARRAY(list, 1);
 			list->type = type;
 			strmap_put(&ctx->paths_to_lists, path.buf, list);
-			string_list_append(&ctx->path_stack, path.buf);
 		}
+		push_to_stack(ctx, path.buf);
+
 		if (!(o->flags & UNINTERESTING))
 			list->maybe_interesting = 1;
+
 		oid_array_append(&list->oids, &entry.oid);
 	}
 
@@ -165,6 +220,12 @@ static int walk_path(struct path_walk_context *ctx,
 	int ret = 0;
 
 	list = strmap_get(&ctx->paths_to_lists, path);
+
+	if (!list)
+		BUG("provided path '%s' that had no associated list", path);
+
+	if (!list->oids.nr)
+		return 0;
 
 	if (ctx->info->prune_all_uninteresting) {
 		/*
@@ -187,11 +248,14 @@ static int walk_path(struct path_walk_context *ctx,
 							     &list->oids.oid[i]);
 				if (t && !(t->object.flags & UNINTERESTING))
 					list->maybe_interesting = 1;
-			} else {
+			} else if (list->type == OBJ_BLOB) {
 				struct blob *b = lookup_blob(ctx->repo,
 							     &list->oids.oid[i]);
 				if (b && !(b->object.flags & UNINTERESTING))
 					list->maybe_interesting = 1;
+			} else {
+				/* Tags are always interesting if visited. */
+				list->maybe_interesting = 1;
 			}
 		}
 
@@ -202,14 +266,15 @@ static int walk_path(struct path_walk_context *ctx,
 
 	/* Evaluate function pointer on this data, if requested. */
 	if ((list->type == OBJ_TREE && ctx->info->trees) ||
-	    (list->type == OBJ_BLOB && ctx->info->blobs))
+	    (list->type == OBJ_BLOB && ctx->info->blobs) ||
+	    (list->type == OBJ_TAG && ctx->info->tags))
 		ret = ctx->info->path_fn(path, &list->oids, list->type,
 					ctx->info->path_fn_data);
 
 	/* Expand data for children. */
 	if (list->type == OBJ_TREE) {
 		for (size_t i = 0; i < list->oids.nr; i++) {
-			ret |= add_children(ctx,
+			ret |= add_tree_entries(ctx,
 					    path,
 					    &list->oids.oid[i]);
 		}
@@ -220,7 +285,7 @@ static int walk_path(struct path_walk_context *ctx,
 	return ret;
 }
 
-static void clear_strmap(struct strmap *map)
+static void clear_paths_to_lists(struct strmap *map)
 {
 	struct hashmap_iter iter;
 	struct strmap_entry *e;
@@ -233,6 +298,161 @@ static void clear_strmap(struct strmap *map)
 	strmap_init(map);
 }
 
+static struct repository *edge_repo;
+static struct type_and_oid_list *edge_tree_list;
+
+static void show_edge(struct commit *commit)
+{
+	struct tree *t = repo_get_commit_tree(edge_repo, commit);
+
+	if (!t)
+		return;
+
+	if (commit->object.flags & UNINTERESTING)
+		t->object.flags |= UNINTERESTING;
+
+	if (t->object.flags & SEEN)
+		return;
+	t->object.flags |= SEEN;
+
+	oid_array_append(&edge_tree_list->oids, &t->object.oid);
+}
+
+static int setup_pending_objects(struct path_walk_info *info,
+				 struct path_walk_context *ctx)
+{
+	struct type_and_oid_list *tags = NULL;
+	struct type_and_oid_list *tagged_blobs = NULL;
+	struct type_and_oid_list *root_tree_list = NULL;
+
+	if (info->tags)
+		CALLOC_ARRAY(tags, 1);
+	if (info->blobs)
+		CALLOC_ARRAY(tagged_blobs, 1);
+	if (info->trees)
+		root_tree_list = strmap_get(&ctx->paths_to_lists, root_path);
+
+	/*
+	 * Pending objects include:
+	 * * Commits at branch tips.
+	 * * Annotated tags at tag tips.
+	 * * Any kind of object at lightweight tag tips.
+	 * * Trees and blobs in the index (with an associated path).
+	 */
+	for (size_t i = 0; i < info->revs->pending.nr; i++) {
+		struct object_array_entry *pending = info->revs->pending.objects + i;
+		struct object *obj = pending->item;
+
+		/* Commits will be picked up by revision walk. */
+		if (obj->type == OBJ_COMMIT)
+			continue;
+
+		/* Navigate annotated tag object chains. */
+		while (obj->type == OBJ_TAG) {
+			struct tag *tag = lookup_tag(info->revs->repo, &obj->oid);
+			if (!tag) {
+				error(_("failed to find tag %s"),
+				      oid_to_hex(&obj->oid));
+				return -1;
+			}
+			if (tag->object.flags & SEEN)
+				break;
+			tag->object.flags |= SEEN;
+
+			if (tags)
+				oid_array_append(&tags->oids, &obj->oid);
+			obj = tag->tagged;
+		}
+
+		if (obj->type == OBJ_TAG)
+			continue;
+
+		/* We are now at a non-tag object. */
+		if (obj->flags & SEEN)
+			continue;
+		obj->flags |= SEEN;
+
+		switch (obj->type) {
+		case OBJ_TREE:
+			if (!info->trees)
+				continue;
+			if (pending->path) {
+				struct type_and_oid_list *list;
+				char *path = *pending->path ? xstrfmt("%s/", pending->path)
+							    : xstrdup("");
+				if (!(list = strmap_get(&ctx->paths_to_lists, path))) {
+					CALLOC_ARRAY(list, 1);
+					list->type = OBJ_TREE;
+					strmap_put(&ctx->paths_to_lists, path, list);
+				}
+				oid_array_append(&list->oids, &obj->oid);
+				free(path);
+			} else {
+				/* assume a root tree, such as a lightweight tag. */
+				oid_array_append(&root_tree_list->oids, &obj->oid);
+			}
+			break;
+
+		case OBJ_BLOB:
+			if (!info->blobs)
+				continue;
+			if (pending->path) {
+				struct type_and_oid_list *list;
+				char *path = pending->path;
+				if (!(list = strmap_get(&ctx->paths_to_lists, path))) {
+					CALLOC_ARRAY(list, 1);
+					list->type = OBJ_BLOB;
+					strmap_put(&ctx->paths_to_lists, path, list);
+				}
+				oid_array_append(&list->oids, &obj->oid);
+			} else {
+				/* assume a root tree, such as a lightweight tag. */
+				oid_array_append(&tagged_blobs->oids, &obj->oid);
+			}
+			break;
+
+		case OBJ_COMMIT:
+			/* Make sure it is in the object walk */
+			if (obj != pending->item)
+				add_pending_object(info->revs, obj, "");
+			break;
+
+		default:
+			BUG("should not see any other type here");
+		}
+	}
+
+	/*
+	 * Add tag objects and tagged blobs if they exist.
+	 */
+	if (tagged_blobs) {
+		if (tagged_blobs->oids.nr) {
+			const char *tagged_blob_path = "/tagged-blobs";
+			tagged_blobs->type = OBJ_BLOB;
+			tagged_blobs->maybe_interesting = 1;
+			strmap_put(&ctx->paths_to_lists, tagged_blob_path, tagged_blobs);
+			push_to_stack(ctx, tagged_blob_path);
+		} else {
+			oid_array_clear(&tagged_blobs->oids);
+			free(tagged_blobs);
+		}
+	}
+	if (tags) {
+		if (tags->oids.nr) {
+			const char *tag_path = "/tags";
+			tags->type = OBJ_TAG;
+			tags->maybe_interesting = 1;
+			strmap_put(&ctx->paths_to_lists, tag_path, tags);
+			push_to_stack(ctx, tag_path);
+		} else {
+			oid_array_clear(&tags->oids);
+			free(tags);
+		}
+	}
+
+	return 0;
+}
+
 /**
  * Given the configuration of 'info', walk the commits based on 'info->revs' and
  * call 'info->path_fn' on each discovered path.
@@ -241,8 +461,7 @@ static void clear_strmap(struct strmap *map)
  */
 int walk_objects_by_path(struct path_walk_info *info)
 {
-	const char *root_path = "";
-	int ret = 0, has_uninteresting = 0;
+	int ret;
 	size_t commits_nr = 0, paths_nr = 0;
 	struct commit *c;
 	struct type_and_oid_list *root_tree_list;
@@ -251,10 +470,13 @@ int walk_objects_by_path(struct path_walk_info *info)
 		.repo = info->revs->repo,
 		.revs = info->revs,
 		.info = info,
-		.path_stack = STRING_LIST_INIT_DUP,
+		.path_stack = {
+			.compare = compare_by_type,
+			.cb_data = &ctx
+		},
+		.path_stack_pushed = STRSET_INIT,
 		.paths_to_lists = STRMAP_INIT
 	};
-	struct oidset root_tree_set = OIDSET_INIT;
 
 	trace2_region_enter("path-walk", "commit-walk", info->revs->repo);
 
@@ -269,10 +491,11 @@ int walk_objects_by_path(struct path_walk_info *info)
 	root_tree_list->type = OBJ_TREE;
 	root_tree_list->maybe_interesting = 1;
 	strmap_put(&ctx.paths_to_lists, root_path, root_tree_list);
+	push_to_stack(&ctx, root_path);
 
 	/*
 	 * Set these values before preparing the walk to catch
-	 * lightweight tags pointing to non-commits.
+	 * lightweight tags pointing to non-commits and indexed objects.
 	 */
 	info->revs->blob_objects = info->blobs;
 	info->revs->tree_objects = info->trees;
@@ -280,71 +503,22 @@ int walk_objects_by_path(struct path_walk_info *info)
 	if (prepare_revision_walk(info->revs))
 		die(_("failed to setup revision walk"));
 
+	/* Walk trees to mark them as UNINTERESTING. */
+	edge_repo = info->revs->repo;
+	edge_tree_list = root_tree_list;
+	mark_edges_uninteresting(info->revs, show_edge,
+				 info->prune_all_uninteresting);
+	edge_repo = NULL;
+	edge_tree_list = NULL;
+
 	info->revs->blob_objects = info->revs->tree_objects = 0;
 
-	if (info->tags) {
-		struct oid_array tagged_blob_list = OID_ARRAY_INIT;
-		struct oid_array tags = OID_ARRAY_INIT;
+	trace2_region_enter("path-walk", "pending-walk", info->revs->repo);
+	ret = setup_pending_objects(info, &ctx);
+	trace2_region_leave("path-walk", "pending-walk", info->revs->repo);
 
-		trace2_region_enter("path-walk", "tag-walk", info->revs->repo);
-
-		/*
-		 * Walk any pending objects at this point, but they should only
-		 * be tags.
-		 */
-		for (size_t i = 0; i < info->revs->pending.nr; i++) {
-			struct object_array_entry *pending = info->revs->pending.objects + i;
-			struct object *obj = pending->item;
-
-			if (obj->type == OBJ_COMMIT || obj->flags & SEEN)
-				continue;
-
-			while (obj->type == OBJ_TAG) {
-				struct tag *tag = lookup_tag(info->revs->repo,
-							     &obj->oid);
-				if (!(obj->flags & SEEN)) {
-					obj->flags |= SEEN;
-					oid_array_append(&tags, &obj->oid);
-				}
-				obj = tag->tagged;
-			}
-
-			if ((obj->flags & SEEN))
-				continue;
-			obj->flags |= SEEN;
-
-			switch (obj->type) {
-			case OBJ_TREE:
-				if (info->trees)
-					oid_array_append(&root_tree_list->oids, &obj->oid);
-				break;
-
-			case OBJ_BLOB:
-				if (info->blobs)
-					oid_array_append(&tagged_blob_list, &obj->oid);
-				break;
-
-			case OBJ_COMMIT:
-				/* Make sure it is in the object walk */
-				add_pending_object(info->revs, obj, "");
-				break;
-
-			default:
-				BUG("should not see any other type here");
-			}
-		}
-
-		info->path_fn("", &tags, OBJ_TAG, info->path_fn_data);
-
-		if (tagged_blob_list.nr && info->blobs)
-			info->path_fn("/tagged-blobs", &tagged_blob_list, OBJ_BLOB,
-				      info->path_fn_data);
-
-		trace2_data_intmax("path-walk", ctx.repo, "tags", tags.nr);
-		trace2_region_leave("path-walk", "tag-walk", info->revs->repo);
-		oid_array_clear(&tags);
-		oid_array_clear(&tagged_blob_list);
-	}
+	if (ret)
+		return ret;
 
 	while ((c = get_revision(info->revs))) {
 		struct object_id *oid;
@@ -362,64 +536,74 @@ int walk_objects_by_path(struct path_walk_info *info)
 		oid = get_commit_tree_oid(c);
 		t = lookup_tree(info->revs->repo, oid);
 
-		if (t) {
-			if (t->object.flags & SEEN)
-				continue;
-			t->object.flags |= SEEN;
-
-			if (!oidset_insert(&root_tree_set, oid))
-				oid_array_append(&root_tree_list->oids, oid);
-		} else {
-			warning("could not find tree %s", oid_to_hex(oid));
+		if (!t) {
+			error("could not find tree %s", oid_to_hex(oid));
+			return -1;
 		}
 
-		if (t && (c->object.flags & UNINTERESTING)) {
-			t->object.flags |= UNINTERESTING;
-			has_uninteresting = 1;
-		}
+		if (t->object.flags & SEEN)
+			continue;
+		t->object.flags |= SEEN;
+		oid_array_append(&root_tree_list->oids, oid);
 	}
 
 	trace2_data_intmax("path-walk", ctx.repo, "commits", commits_nr);
 	trace2_region_leave("path-walk", "commit-walk", info->revs->repo);
 
 	/* Track all commits. */
-	if (info->commits)
+	if (info->commits && commit_list->oids.nr)
 		ret = info->path_fn("", &commit_list->oids, OBJ_COMMIT,
 				    info->path_fn_data);
 	oid_array_clear(&commit_list->oids);
 	free(commit_list);
 
-	/*
-	 * Before performing a DFS of our paths and emitting them as interesting,
-	 * do a full walk of the trees to distribute the UNINTERESTING bit. Use
-	 * the sparse algorithm if prune_all_uninteresting was set.
-	 */
-	if (has_uninteresting) {
-		trace2_region_enter("path-walk", "uninteresting-walk", info->revs->repo);
-		if (info->prune_all_uninteresting)
-			mark_trees_uninteresting_sparse(ctx.repo, &root_tree_set);
-		else
-			mark_trees_uninteresting_dense(ctx.repo, &root_tree_set);
-		trace2_region_leave("path-walk", "uninteresting-walk", info->revs->repo);
-	}
-	oidset_clear(&root_tree_set);
-
-	string_list_append(&ctx.path_stack, root_path);
-
 	trace2_region_enter("path-walk", "path-walk", info->revs->repo);
 	while (!ret && ctx.path_stack.nr) {
-		char *path = ctx.path_stack.items[ctx.path_stack.nr - 1].string;
-		ctx.path_stack.nr--;
+		char *path = prio_queue_get(&ctx.path_stack);
 		paths_nr++;
 
 		ret = walk_path(&ctx, path);
 
 		free(path);
 	}
+
+	/* Are there paths remaining? Likely they are from indexed objects. */
+	if (!strmap_empty(&ctx.paths_to_lists)) {
+		struct hashmap_iter iter;
+		struct strmap_entry *entry;
+
+		strmap_for_each_entry(&ctx.paths_to_lists, &iter, entry)
+			push_to_stack(&ctx, entry->key);
+
+		while (!ret && ctx.path_stack.nr) {
+			char *path = prio_queue_get(&ctx.path_stack);
+			paths_nr++;
+
+			ret = walk_path(&ctx, path);
+
+			free(path);
+		}
+	}
+
 	trace2_data_intmax("path-walk", ctx.repo, "paths", paths_nr);
 	trace2_region_leave("path-walk", "path-walk", info->revs->repo);
 
-	clear_strmap(&ctx.paths_to_lists);
-	string_list_clear(&ctx.path_stack, 0);
+	clear_paths_to_lists(&ctx.paths_to_lists);
+	strset_clear(&ctx.path_stack_pushed);
+	clear_prio_queue(&ctx.path_stack);
 	return ret;
+}
+
+void path_walk_info_init(struct path_walk_info *info)
+{
+	struct path_walk_info empty = PATH_WALK_INFO_INIT;
+	memcpy(info, &empty, sizeof(empty));
+}
+
+void path_walk_info_clear(struct path_walk_info *info)
+{
+	if (info->pl) {
+		clear_pattern_list(info->pl);
+		free(info->pl);
+	}
 }
